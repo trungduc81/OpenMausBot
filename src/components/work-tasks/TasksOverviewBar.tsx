@@ -1,6 +1,7 @@
-import { AlertTriangle, CheckCircle2, Clock, Eye, Layers, PlayCircle } from "lucide-react";
+import { Activity, AlertTriangle, CheckCircle2, Clock, Coins, Eye, Kanban, Layers, PlayCircle } from "lucide-react";
 import { cn } from "@/lib/cn";
 import { t } from "@/lib/i18n";
+import { formatTokens } from "@/lib/usage";
 import type { Bot } from "@/state/store";
 import type { AgentTaskStatus, RoomWorkTaskOverview } from "../../../shared/work-tasks";
 import { BotAvatar } from "../Avatar";
@@ -16,11 +17,15 @@ export function TasksOverviewBar({
   members,
   activeFilter,
   onSelectFilter,
+  viewMode = "board",
+  onChangeViewMode,
 }: {
   overview: RoomWorkTaskOverview;
   members: Bot[];
   activeFilter: OverviewQuickFilter;
   onSelectFilter: (next: OverviewQuickFilter) => void;
+  viewMode?: "board" | "timeline";
+  onChangeViewMode?: (mode: "board" | "timeline") => void;
 }) {
   const memberById = new Map(members.map((m) => [m.id, m]));
 
@@ -110,38 +115,96 @@ export function TasksOverviewBar({
 
   return (
     <div className="flex flex-col gap-2 border-b border-hairline bg-panel/60 px-4 py-2.5">
-      <div className="flex flex-wrap items-center gap-1.5">
-        {statChips.map((chip) => {
-          const Icon = chip.icon;
-          const toneClass =
-            chip.tone === "danger" && chip.count > 0
-              ? "text-danger"
-              : chip.tone === "warning" && chip.count > 0
-                ? "text-warning"
-                : chip.tone === "success" && chip.count > 0
-                  ? "text-success"
-                  : chip.tone === "accent" && chip.count > 0
-                    ? "text-accent-text"
-                    : "text-ink-secondary";
-          return (
-            <button
-              key={chip.key}
-              type="button"
-              onClick={chip.onClick}
-              aria-pressed={chip.active}
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex flex-wrap items-center gap-1.5">
+          {statChips.map((chip) => {
+            const Icon = chip.icon;
+            const toneClass =
+              chip.tone === "danger" && chip.count > 0
+                ? "text-danger"
+                : chip.tone === "warning" && chip.count > 0
+                  ? "text-warning"
+                  : chip.tone === "success" && chip.count > 0
+                    ? "text-success"
+                    : chip.tone === "accent" && chip.count > 0
+                      ? "text-accent-text"
+                      : "text-ink-secondary";
+            return (
+              <button
+                key={chip.key}
+                type="button"
+                onClick={chip.onClick}
+                aria-pressed={chip.active}
+                className={cn(
+                  "inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-[12px] transition-colors",
+                  chip.active
+                    ? "border-accent bg-accent/10 font-medium text-ink"
+                    : "border-hairline bg-card text-ink-secondary hover:bg-ink/[0.04] hover:text-ink",
+                )}
+              >
+                <Icon size={13} className={toneClass} aria-hidden="true" />
+                <span>{chip.label}</span>
+                <span className="font-mono text-[11px] font-semibold tabular-nums text-ink">{chip.count}</span>
+              </button>
+            );
+          })}
+
+          {(overview.totalCostUsd > 0 || overview.totalTokens > 0 || overview.overBudget > 0) && (
+            <span
               className={cn(
-                "inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-[12px] transition-colors",
-                chip.active
-                  ? "border-accent bg-accent/10 font-medium text-ink"
-                  : "border-hairline bg-card text-ink-secondary hover:bg-ink/[0.04] hover:text-ink",
+                "inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-[12px]",
+                overview.overBudget > 0
+                  ? "border-danger/40 bg-danger/10 text-danger"
+                  : "border-hairline bg-card text-ink-secondary",
               )}
             >
-              <Icon size={13} className={toneClass} aria-hidden="true" />
-              <span>{chip.label}</span>
-              <span className="font-mono text-[11px] font-semibold tabular-nums text-ink">{chip.count}</span>
+              <Coins size={13} />
+              <span>{t("workTasks.budget.spend")}</span>
+              <span className="font-mono text-[11px] font-semibold tabular-nums text-ink">
+                ${overview.totalCostUsd < 0.01 && overview.totalCostUsd > 0 ? overview.totalCostUsd.toFixed(4) : overview.totalCostUsd.toFixed(3)}
+              </span>
+              {overview.totalTokens > 0 && (
+                <span className="font-mono text-[10px] text-ink-tertiary">
+                  ({formatTokens(overview.totalTokens)})
+                </span>
+              )}
+              {overview.overBudget > 0 && (
+                <span className="rounded bg-danger/20 px-1 py-0.5 text-[10px] font-semibold text-danger">
+                  {overview.overBudget} {t("workTasks.budget.overBudget")}
+                </span>
+              )}
+            </span>
+          )}
+        </div>
+
+        {onChangeViewMode && (
+          <div className="inline-flex rounded-lg border border-hairline bg-card p-0.5 text-[12px]">
+            <button
+              type="button"
+              onClick={() => onChangeViewMode("board")}
+              aria-pressed={viewMode === "board"}
+              className={cn(
+                "inline-flex items-center gap-1 rounded-md px-2.5 py-1 transition-colors",
+                viewMode === "board" ? "bg-ink font-medium text-app" : "text-ink-secondary hover:text-ink",
+              )}
+            >
+              <Kanban size={13} />
+              <span>{t("workTasks.view.board")}</span>
             </button>
-          );
-        })}
+            <button
+              type="button"
+              onClick={() => onChangeViewMode("timeline")}
+              aria-pressed={viewMode === "timeline"}
+              className={cn(
+                "inline-flex items-center gap-1 rounded-md px-2.5 py-1 transition-colors",
+                viewMode === "timeline" ? "bg-ink font-medium text-app" : "text-ink-secondary hover:text-ink",
+              )}
+            >
+              <Activity size={13} />
+              <span>{t("workTasks.view.timeline")}</span>
+            </button>
+          </div>
+        )}
       </div>
 
       {overview.byAgent.length > 0 && (

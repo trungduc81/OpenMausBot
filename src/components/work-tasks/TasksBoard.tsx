@@ -2,16 +2,20 @@ import { useMemo, useState } from "react";
 import {
   AlertTriangle,
   Calendar,
+  Coins,
   ExternalLink,
   FileCheck2,
   GitBranch,
   MessageSquare,
+  Play,
   Plus,
   Search,
+  Send,
   Settings2,
 } from "lucide-react";
 import { cn } from "@/lib/cn";
 import { t } from "@/lib/i18n";
+import { formatTokens } from "@/lib/usage";
 import type { Bot } from "@/state/store";
 import {
   AGENT_TASK_PRIORITIES,
@@ -20,11 +24,13 @@ import {
   BOARD_COLUMNS,
   boardColumnForStatus,
   canTransitionWorkTask,
+  isTaskOverBudget,
   type AgentTask,
   type AgentTaskPriority,
   type AgentTaskStatus,
   type AgentTaskType,
   type RoomJiraPublicConfig,
+  type TelegramBridgePublicConfig,
 } from "../../../shared/work-tasks";
 import { BotAvatar } from "../Avatar";
 
@@ -55,13 +61,17 @@ export function TasksBoard({
   members,
   filters,
   jiraConfig,
+  telegramConfig,
   onChangeFilters,
   onResetFilters,
   onOpenNewTask,
   onOpenJiraSettings,
+  onOpenTelegramSettings,
   onSelectTask,
   onMoveTask,
   onOpenThread,
+  onRunTask,
+  runningTaskId,
   boardError,
   onDismissError,
 }: {
@@ -69,13 +79,17 @@ export function TasksBoard({
   members: Bot[];
   filters: BoardFilters;
   jiraConfig: RoomJiraPublicConfig | null;
+  telegramConfig?: TelegramBridgePublicConfig | null;
   onChangeFilters: (patch: Partial<BoardFilters>) => void;
   onResetFilters: () => void;
   onOpenNewTask: () => void;
   onOpenJiraSettings: () => void;
+  onOpenTelegramSettings?: () => void;
   onSelectTask: (taskId: string) => void;
   onMoveTask: (task: AgentTask, toStatus: AgentTaskStatus) => void;
   onOpenThread: (task: AgentTask) => void;
+  onRunTask?: (task: AgentTask) => void;
+  runningTaskId?: string | null;
   boardError: string | null;
   onDismissError: () => void;
 }) {
@@ -230,6 +244,25 @@ export function TasksBoard({
         </div>
 
         <div className="flex items-center gap-2">
+          {onOpenTelegramSettings && (
+            <button
+              type="button"
+              onClick={onOpenTelegramSettings}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-hairline bg-control px-2.5 py-1 text-[12px] text-ink hover:bg-raised-hover"
+            >
+              <Send size={12} />
+              <span>Telegram</span>
+              {telegramConfig?.enabled && (
+                <span
+                  className={cn(
+                    "size-2 rounded-full",
+                    telegramConfig.lastError ? "bg-danger" : "bg-success",
+                  )}
+                />
+              )}
+            </button>
+          )}
+
           <button
             type="button"
             onClick={onOpenJiraSettings}
@@ -335,6 +368,15 @@ export function TasksBoard({
                   const jiraKey = task.jiraSync?.issueKey ?? jiraLink?.key;
                   const depCount = task.dependencies?.length ?? 0;
                   const evCount = task.evidence?.length ?? 0;
+                  const overBudget = isTaskOverBudget(task);
+                  const costUsd = task.usage?.costUsd ?? 0;
+                  const totalTok = (task.usage?.inputTokens ?? 0) + (task.usage?.outputTokens ?? 0);
+                  const canRun = Boolean(
+                    onRunTask &&
+                    !runtimeWorking &&
+                    ["backlog", "todo", "rework", "failed", "blocked"].includes(task.status),
+                  );
+                  const isDispatching = runningTaskId === task.id;
 
                   return (
                     <div
@@ -419,10 +461,28 @@ export function TasksBoard({
                         )}
                       </div>
 
-                      {/* Footer meta: Jira, deadline, deps, evidence, thread jump */}
-                      {(jiraKey || task.dueAt || depCount > 0 || evCount > 0 || task.threadId) && (
+                      {/* Footer meta: Budget, Jira, deadline, deps, evidence, run, thread jump */}
+                      {(jiraKey || task.dueAt || depCount > 0 || evCount > 0 || task.threadId || costUsd > 0 || task.budgetUsd || (task.reworkCount ?? 0) > 0 || canRun) && (
                         <div className="mt-2 flex flex-wrap items-center justify-between gap-1.5 border-t border-hairline/60 pt-1.5 text-[10px] text-ink-tertiary">
                           <div className="flex flex-wrap items-center gap-2">
+                            {(costUsd > 0 || task.budgetUsd) && (
+                              <span
+                                className={cn(
+                                  "inline-flex items-center gap-0.5 font-mono",
+                                  overBudget ? "font-semibold text-danger" : "text-ink-secondary",
+                                )}
+                              >
+                                <Coins size={10} />
+                                ${costUsd < 0.01 && costUsd > 0 ? costUsd.toFixed(4) : costUsd.toFixed(3)}
+                                {task.budgetUsd ? `/$${task.budgetUsd.toFixed(2)}` : ""}
+                                {!task.budgetUsd && totalTok > 0 ? ` · ${formatTokens(totalTok)}` : ""}
+                              </span>
+                            )}
+                            {(task.reworkCount ?? 0) > 0 && (
+                              <span className="rounded bg-warning/15 px-1 py-0.5 text-[9px] font-semibold text-warning">
+                                {t("workTasks.autoQa.reworkBadge", { count: task.reworkCount ?? 0 })}
+                              </span>
+                            )}
                             {jiraKey && (
                               <span
                                 className={cn(
@@ -454,19 +514,36 @@ export function TasksBoard({
                             )}
                           </div>
 
-                          {task.threadId && (
-                            <button
-                              type="button"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                onOpenThread(task);
-                              }}
-                              title={t("workTasks.detail.openThread")}
-                              className="inline-flex items-center gap-0.5 rounded px-1 py-0.5 text-ink-secondary hover:bg-ink/[0.06] hover:text-ink"
-                            >
-                              <MessageSquare size={10} />
-                            </button>
-                          )}
+                          <div className="flex items-center gap-1">
+                            {canRun && (
+                              <button
+                                type="button"
+                                disabled={isDispatching}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  onRunTask?.(task);
+                                }}
+                                title={t("workTasks.action.runTask")}
+                                className="inline-flex items-center gap-0.5 rounded bg-accent/15 px-1.5 py-0.5 font-medium text-accent-text hover:bg-accent/25 disabled:opacity-50"
+                              >
+                                <Play size={9} />
+                                <span>{isDispatching ? "…" : t("workTasks.action.run")}</span>
+                              </button>
+                            )}
+                            {task.threadId && (
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  onOpenThread(task);
+                                }}
+                                title={t("workTasks.detail.openThread")}
+                                className="inline-flex items-center gap-0.5 rounded px-1 py-0.5 text-ink-secondary hover:bg-ink/[0.06] hover:text-ink"
+                              >
+                                <MessageSquare size={10} />
+                              </button>
+                            )}
+                          </div>
                         </div>
                       )}
                     </div>

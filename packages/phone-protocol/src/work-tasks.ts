@@ -43,6 +43,16 @@ export interface AgentTaskJiraSync {
   lastSyncDirection?: "push" | "pull";
 }
 
+export interface AgentTaskUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cachedInputTokens: number;
+  costUsd: number;
+  turns: number;
+  lastModel?: string;
+  lastUpdatedAt?: number;
+}
+
 export interface AgentTask {
   id: string;
   key: string;
@@ -58,6 +68,11 @@ export interface AgentTask {
   assigneeName?: string;
   assigneeRole?: string;
   qaBotId?: string;
+  autoQa?: boolean;
+  qaThreadId?: string;
+  reworkCount?: number;
+  budgetUsd?: number;
+  usage?: AgentTaskUsage;
   reporterType: "user" | "agent" | "system";
   reporterId?: string;
   acceptanceCriteria?: string[];
@@ -82,6 +97,7 @@ export interface AgentTask {
 export type TaskActivityType =
   | "created"
   | "assigned"
+  | "dispatched"
   | "status-changed"
   | "progress"
   | "comment"
@@ -89,6 +105,7 @@ export type TaskActivityType =
   | "blocked"
   | "reviewed"
   | "jira-synced"
+  | "budget-exceeded"
   | "error";
 
 export interface TaskActivity {
@@ -103,7 +120,18 @@ export interface TaskActivity {
   message: string;
   fromStatus?: AgentTaskStatus;
   toStatus?: AgentTaskStatus;
+  durationMs?: number;
+  costUsd?: number;
+  tokens?: number;
+  threadId?: string;
   createdAt: number;
+}
+
+export interface RoomTimelineEvent extends TaskActivity {
+  taskKey: string;
+  taskTitle: string;
+  taskStatus: AgentTaskStatus;
+  assigneeBotId?: string;
 }
 
 export interface RoomJiraPublicConfig {
@@ -117,6 +145,20 @@ export interface RoomJiraPublicConfig {
   statusMap: Partial<Record<AgentTaskStatus, string>>;
   autoSync: boolean;
   lastSyncedAt?: number;
+  lastError?: string;
+}
+
+export interface TelegramBridgePublicConfig {
+  enabled: boolean;
+  hasBotToken: boolean;
+  botUsername?: string;
+  allowedChatIds: string[];
+  notifyOnBlocked: boolean;
+  notifyOnBudgetExceeded: boolean;
+  notifyOnDone: boolean;
+  notifyOnRework: boolean;
+  allowRemoteActions: boolean;
+  lastPollAt?: number;
   lastError?: string;
 }
 
@@ -269,6 +311,15 @@ export interface AgentWorkloadSummary {
   hasFailures: boolean;
 }
 
+export function isTaskOverBudget(task: Pick<AgentTask, "budgetUsd" | "usage">): boolean {
+  return (
+    typeof task.budgetUsd === "number" &&
+    Number.isFinite(task.budgetUsd) &&
+    task.budgetUsd > 0 &&
+    (task.usage?.costUsd ?? 0) >= task.budgetUsd
+  );
+}
+
 export interface RoomWorkTaskOverview {
   total: number;
   backlog: number;
@@ -282,6 +333,9 @@ export interface RoomWorkTaskOverview {
   cancelled: number;
   overdue: number;
   waitingQa: number;
+  totalCostUsd: number;
+  totalTokens: number;
+  overBudget: number;
   byAgent: AgentWorkloadSummary[];
 }
 
@@ -302,6 +356,9 @@ export function computeRoomTaskOverview(
     cancelled: 0,
   };
   let overdue = 0;
+  let totalCostUsd = 0;
+  let totalTokens = 0;
+  let overBudget = 0;
   const agentBuckets = new Map<string, AgentWorkloadSummary>();
 
   for (const member of members) {
@@ -322,6 +379,13 @@ export function computeRoomTaskOverview(
 
   for (const task of tasks) {
     counts[task.status] = (counts[task.status] ?? 0) + 1;
+    if (task.usage) {
+      totalCostUsd += task.usage.costUsd;
+      totalTokens += task.usage.inputTokens + task.usage.outputTokens;
+    }
+    if (isTaskOverBudget(task)) {
+      overBudget += 1;
+    }
     if (
       task.dueAt !== undefined &&
       task.dueAt < now &&
@@ -375,6 +439,9 @@ export function computeRoomTaskOverview(
     cancelled: counts.cancelled,
     overdue,
     waitingQa: counts["in-review"],
+    totalCostUsd,
+    totalTokens,
+    overBudget,
     byAgent: [...agentBuckets.values()],
   };
 }

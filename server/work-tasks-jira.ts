@@ -3,10 +3,17 @@ import { createHash } from "node:crypto";
 import type { AgentTask, AgentTaskStatus } from "../shared/work-tasks.ts";
 import type { RoomJiraStoredConfig, WorkTaskActor, WorkTaskStore } from "./work-tasks.ts";
 
+export interface ResolvedJiraBot {
+  id: string;
+  name: string;
+  title?: string;
+}
+
 export interface JiraSyncServiceOptions {
   store: WorkTaskStore;
   fetchImpl?: typeof fetch;
   now?: () => number;
+  resolveRoomBot?: (roomId: string, hint: string) => ResolvedJiraBot | undefined;
 }
 
 const DEFAULT_STATUS_TO_JIRA: Record<AgentTaskStatus, string> = {
@@ -100,16 +107,43 @@ export function formatJiraAttributedComment(
   return `[${who}${roleTag} via LOOMA]: ${message}`;
 }
 
+function stripLoomaKeyPrefix(summary: string): string {
+  return summary.replace(/^\[[A-Z0-9_]+-\d+\]\s*/i, "").trim() || summary.trim();
+}
+
+function extractLogicalAgentHint(
+  fields: Record<string, unknown> | undefined,
+  config: RoomJiraStoredConfig | undefined,
+): string | undefined {
+  if (!fields) return undefined;
+  if (config?.assigneeCustomFieldId) {
+    const raw = fields[config.assigneeCustomFieldId];
+    if (typeof raw === "string" && raw.trim()) {
+      return raw.replace(/\s*\([^)]*\)\s*$/, "").trim();
+    }
+  }
+  if (Array.isArray(fields.labels)) {
+    for (const label of fields.labels) {
+      if (typeof label === "string" && label.toLowerCase().startsWith("looma-agent:")) {
+        return label.slice("looma-agent:".length).replace(/-/g, " ").trim();
+      }
+    }
+  }
+  return undefined;
+}
+
 export class JiraSyncService {
   private readonly store: WorkTaskStore;
   private readonly fetchImpl: typeof fetch;
   private readonly now: () => number;
+  private readonly resolveRoomBot?: (roomId: string, hint: string) => ResolvedJiraBot | undefined;
   private readonly inflight = new Set<string>();
 
   constructor(options: JiraSyncServiceOptions) {
     this.store = options.store;
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.now = options.now ?? Date.now;
+    this.resolveRoomBot = options.resolveRoomBot;
   }
 
   private authHeaders(email: string, apiToken: string): Record<string, string> {
@@ -212,6 +246,12 @@ export class JiraSyncService {
     }
     const { config, apiToken } = creds;
     try {
+      const parentTask = task.parentTaskId ? this.store.get(task.parentTaskId) : undefined;
+      const parentJiraKey =
+        parentTask?.jiraSync?.issueKey ||
+        parentTask?.externalLinks?.find((l) => l.provider === "jira")?.key;
+      const isJiraSubtask = task.type === "subtask" && Boolean(parentJiraKey);
+
       const fields: Record<string, unknown> = {
         project: { key: config.projectKey },
         summary: `[${task.key}] ${task.title}`,
@@ -223,17 +263,33 @@ export class JiraSyncService {
             `Logical Assignee: ${task.assigneeName ?? "Unassigned"}${task.assigneeRole ? ` (${task.assigneeRole})` : ""}`,
           ].join("\n"),
         ),
-        issuetype: { name: task.type === "bug" ? "Bug" : task.type === "epic" ? "Epic" : config.issueType || "Task" },
+        issuetype: {
+          name: isJiraSubtask
+            ? "Sub-task"
+            : task.type === "bug"
+              ? "Bug"
+              : task.type === "epic"
+                ? "Epic"
+                : config.issueType || "Task",
+        },
+        ...(isJiraSubtask && parentJiraKey ? { parent: { key: parentJiraKey } } : {}),
         labels: logicalAgentLabels(task),
         priority: { name: PRIORITY_TO_JIRA[task.priority] },
       };
       if (config.assigneeCustomFieldId && (task.assigneeName || task.assigneeBotId)) {
         fields[config.assigneeCustomFieldId] = `${task.assigneeName ?? task.assigneeBotId}${task.assigneeRole ? ` (${task.assigneeRole})` : ""}`;
       }
-      const created = await this.requestJson(config, apiToken, "/rest/api/3/issue", {
+      let created = await this.requestJson(config, apiToken, "/rest/api/3/issue", {
         method: "POST",
         body: JSON.stringify({ fields }),
       });
+      // Team-managed Jira projects often name the subtask issue type "Subtask" instead of "Sub-task".
+      if (!created.ok && created.status === 400 && isJiraSubtask) {
+        created = await this.requestJson(config, apiToken, "/rest/api/3/issue", {
+          method: "POST",
+          body: JSON.stringify({ fields: { ...fields, issuetype: { name: "Subtask" } } }),
+        });
+      }
       if (!created.ok) {
         const updated = this.recordFailure(task, created.errorText!);
         return { ok: false, task: updated, error: created.errorText };
@@ -391,19 +447,219 @@ export class JiraSyncService {
     }
   }
 
-  /** Handles incoming Jira webhook events with loop detection & stale-timestamp protection. */
+  /**
+   * Pulls latest status/priority/assignee and newly created Jira subtasks into LOOMA using only the API token.
+   */
+  async pullFromJira(taskIdOrKey: string): Promise<{
+    ok: boolean;
+    task?: AgentTask;
+    createdSubtasks: AgentTask[];
+    updatedSubtasks: AgentTask[];
+    error?: string;
+  }> {
+    const task = this.store.get(taskIdOrKey);
+    if (!task) return { ok: false, createdSubtasks: [], updatedSubtasks: [], error: `Task "${taskIdOrKey}" not found.` };
+    const issueKey = task.jiraSync?.issueKey || task.externalLinks?.find((l) => l.provider === "jira")?.key;
+    if (!issueKey) return { ok: false, createdSubtasks: [], updatedSubtasks: [], error: "Task is not linked to a Jira issue." };
+    const creds = this.requireCreds(task.roomId);
+    if ("error" in creds) {
+      this.recordFailure(task, creds.error);
+      return { ok: false, task: this.store.get(task.id), createdSubtasks: [], updatedSubtasks: [], error: creds.error };
+    }
+    const { config, apiToken } = creds;
+    try {
+      const fieldList = ["summary", "description", "status", "priority", "updated", "labels", "subtasks"];
+      if (config.assigneeCustomFieldId) fieldList.push(config.assigneeCustomFieldId);
+      const res = await this.requestJson(
+        config,
+        apiToken,
+        `/rest/api/3/issue/${encodeURIComponent(issueKey)}?fields=${encodeURIComponent(fieldList.join(","))}`,
+      );
+      if (!res.ok) {
+        const updated = this.recordFailure(task, res.errorText!);
+        return { ok: false, task: updated, createdSubtasks: [], updatedSubtasks: [], error: res.errorText };
+      }
+
+      const fields = (res.body?.fields ?? {}) as Record<string, unknown>;
+      this.applyRemoteFieldsToTask(task, issueKey, fields, config, { actorType: "system", actorName: "Jira Pull" });
+
+      const createdSubtasks: AgentTask[] = [];
+      const updatedSubtasks: AgentTask[] = [];
+      const remoteSubtasks = Array.isArray(fields.subtasks)
+        ? (fields.subtasks as Array<{ id?: string; key?: string; fields?: Record<string, unknown> }>)
+        : [];
+
+      for (const sub of remoteSubtasks) {
+        if (!sub?.key) continue;
+        let subFields = sub.fields ?? {};
+        // Fetch full subtask fields to capture description, labels, and custom assignee field
+        const subDetail = await this.requestJson(
+          config,
+          apiToken,
+          `/rest/api/3/issue/${encodeURIComponent(sub.key)}?fields=${encodeURIComponent(fieldList.join(","))}`,
+        );
+        if (subDetail.ok && subDetail.body?.fields) {
+          subFields = subDetail.body.fields as Record<string, unknown>;
+        }
+        const existingSub = this.store.findByJiraKey(sub.key);
+        if (existingSub) {
+          const syncedSub = this.applyRemoteFieldsToTask(existingSub, sub.key, subFields, config, {
+            actorType: "system",
+            actorName: "Jira Pull",
+          });
+          if (syncedSub) updatedSubtasks.push(syncedSub);
+        } else {
+          const imported = this.createSubtaskFromJiraIssue(task, sub.key, sub.id, subFields, config, {
+            actorType: "system",
+            actorName: "Jira Pull",
+          });
+          if (imported) createdSubtasks.push(imported);
+        }
+      }
+
+      this.store.saveRoomJiraConfig(task.roomId, { lastSyncedAt: this.now(), lastError: "" });
+      return {
+        ok: true,
+        task: this.store.get(task.id),
+        createdSubtasks,
+        updatedSubtasks,
+      };
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      return { ok: false, task: this.recordFailure(task, msg), createdSubtasks: [], updatedSubtasks: [], error: msg };
+    }
+  }
+
+  private createSubtaskFromJiraIssue(
+    parentTask: AgentTask,
+    issueKey: string,
+    issueId: string | undefined,
+    fields: Record<string, unknown>,
+    config: RoomJiraStoredConfig | undefined,
+    actor: WorkTaskActor,
+  ): AgentTask | undefined {
+    const rawSummary = typeof fields.summary === "string" ? fields.summary : issueKey;
+    const title = stripLoomaKeyPrefix(rawSummary);
+    const description = adfToPlainText(fields.description).trim() || undefined;
+    const jiraStatus = (fields.status as { name?: string } | undefined)?.name;
+    const mappedStatus = jiraStatus && config ? this.mapJiraStatusToLooma(config, jiraStatus) : undefined;
+    const priorityName = (fields.priority as { name?: string } | undefined)?.name;
+    const mappedPriority = priorityName ? JIRA_TO_LOOMA_PRIORITY[priorityName.toLowerCase()] : undefined;
+
+    const agentHint = extractLogicalAgentHint(fields, config);
+    const matchedBot = agentHint && this.resolveRoomBot ? this.resolveRoomBot(parentTask.roomId, agentHint) : undefined;
+
+    const created = this.store.create(
+      {
+        roomId: parentTask.roomId,
+        parentTaskId: parentTask.id,
+        type: "subtask",
+        title,
+        ...(description ? { description } : {}),
+        ...(mappedStatus ? { status: mappedStatus } : {}),
+        ...(mappedPriority ? { priority: mappedPriority } : {}),
+        ...(parentTask.coordinatorBotId ? { coordinatorBotId: parentTask.coordinatorBotId } : {}),
+        ...(matchedBot
+          ? { assigneeBotId: matchedBot.id, assigneeName: matchedBot.name, ...(matchedBot.title ? { assigneeRole: matchedBot.title } : {}) }
+          : {}),
+      },
+      actor,
+    );
+
+    const baseUrl = config?.baseUrl || "https://jira.atlassian.net";
+    const remoteUpdatedMs = typeof fields.updated === "string" ? Date.parse(fields.updated) : this.now();
+    return this.store.setJiraSyncState(
+      created.task.id,
+      {
+        issueKey,
+        ...(issueId ? { issueId } : {}),
+        projectKey: issueKey.split("-")[0],
+        lastSyncedAt: this.now(),
+        lastRemoteUpdatedAt: Number.isFinite(remoteUpdatedMs) ? remoteUpdatedMs : this.now(),
+        lastSyncedFingerprint: taskSyncFingerprint(created.task),
+        lastSyncDirection: "pull",
+        lastError: undefined,
+      },
+      { provider: "jira", key: issueKey, url: `${baseUrl}/browse/${issueKey}` },
+      `Imported Jira subtask ${issueKey} under ${parentTask.key}`,
+    );
+  }
+
+  private applyRemoteFieldsToTask(
+    task: AgentTask,
+    issueKey: string,
+    fields: Record<string, unknown>,
+    config: RoomJiraStoredConfig | undefined,
+    actor: WorkTaskActor,
+  ): AgentTask | undefined {
+    const jiraStatus = (fields.status as { name?: string } | undefined)?.name;
+    const mappedStatus = jiraStatus && config ? this.mapJiraStatusToLooma(config, jiraStatus) : undefined;
+    const priorityName = (fields.priority as { name?: string } | undefined)?.name;
+    const nextPriority = priorityName ? JIRA_TO_LOOMA_PRIORITY[priorityName.toLowerCase()] : undefined;
+
+    const agentHint = extractLogicalAgentHint(fields, config);
+    const matchedBot = agentHint && this.resolveRoomBot ? this.resolveRoomBot(task.roomId, agentHint) : undefined;
+
+    if (matchedBot && matchedBot.id !== task.assigneeBotId) {
+      this.store.assign(
+        task.id,
+        {
+          assigneeBotId: matchedBot.id,
+          assigneeName: matchedBot.name,
+          ...(matchedBot.title ? { assigneeRole: matchedBot.title } : {}),
+        },
+        actor,
+      );
+    }
+
+    if (nextPriority && nextPriority !== task.priority) {
+      this.store.update(task.id, { priority: nextPriority }, actor);
+    }
+
+    if (mappedStatus && mappedStatus !== task.status) {
+      try {
+        this.store.transition(task.id, mappedStatus, actor, {
+          message: `Synced from Jira (${issueKey}: ${jiraStatus})`,
+          activityType: "jira-synced",
+        });
+      } catch {
+        this.store.addActivity(
+          task.id,
+          { type: "jira-synced", message: `Ignored invalid Jira transition "${task.status}" -> "${mappedStatus}" from ${issueKey}` },
+          actor,
+        );
+      }
+    }
+
+    const refreshed = this.store.get(task.id);
+    if (!refreshed) return undefined;
+    const remoteUpdatedMs = typeof fields.updated === "string" ? Date.parse(fields.updated) : this.now();
+    return this.store.setJiraSyncState(refreshed.id, {
+      lastSyncedAt: this.now(),
+      lastRemoteUpdatedAt: Number.isFinite(remoteUpdatedMs) ? remoteUpdatedMs : this.now(),
+      lastSyncedFingerprint: taskSyncFingerprint(refreshed),
+      lastSyncDirection: "pull",
+      lastError: undefined,
+    });
+  }
+
+  /** Handles incoming Jira webhook events with loop detection, subtask import & stale-timestamp protection. */
   handleWebhook(payload: unknown): { handled: boolean; ignoredReason?: string; task?: AgentTask } {
     if (!payload || typeof payload !== "object") {
       return { handled: false, ignoredReason: "Invalid webhook payload" };
     }
     const body = payload as {
       issue?: {
+        id?: string;
         key?: string;
-        fields?: {
+        fields?: Record<string, unknown> & {
           summary?: string;
+          description?: unknown;
           updated?: string;
           status?: { name?: string };
           priority?: { name?: string };
+          parent?: { key?: string };
+          labels?: string[];
         };
       };
       comment?: {
@@ -416,8 +672,32 @@ export class JiraSyncService {
     const issueKey = body.issue?.key;
     if (!issueKey) return { handled: false, ignoredReason: "Missing issue.key" };
 
+    const jiraActor: WorkTaskActor = {
+      actorType: "system",
+      actorName: body.comment?.author?.displayName ? `${body.comment.author.displayName} (Jira)` : "Jira",
+    };
+
     const task = this.store.findByJiraKey(issueKey);
-    if (!task) return { handled: false, ignoredReason: `No LOOMA task linked to ${issueKey}` };
+    if (!task) {
+      // Auto-import a manually created Jira Sub-task when its parent issue is already linked in LOOMA.
+      const parentKey = body.issue?.fields?.parent?.key;
+      if (parentKey) {
+        const parentTask = this.store.findByJiraKey(parentKey);
+        if (parentTask) {
+          const { config } = this.store.getRoomJiraSecrets(parentTask.roomId);
+          const imported = this.createSubtaskFromJiraIssue(
+            parentTask,
+            issueKey,
+            body.issue?.id,
+            body.issue?.fields ?? {},
+            config,
+            jiraActor,
+          );
+          return { handled: Boolean(imported), task: imported };
+        }
+      }
+      return { handled: false, ignoredReason: `No LOOMA task linked to ${issueKey}` };
+    }
 
     const { config } = this.store.getRoomJiraSecrets(task.roomId);
     const remoteUpdatedMs = body.issue?.fields?.updated ? Date.parse(body.issue.fields.updated) : body.timestamp ?? 0;
@@ -426,11 +706,6 @@ export class JiraSyncService {
     if (remoteUpdatedMs > 0 && remoteUpdatedMs <= Math.max(task.updatedAt, task.jiraSync?.lastRemoteUpdatedAt ?? 0)) {
       return { handled: false, ignoredReason: "Stale Jira update older than current LOOMA state" };
     }
-
-    const jiraActor: WorkTaskActor = {
-      actorType: "system",
-      actorName: body.comment?.author?.displayName ? `${body.comment.author.displayName} (Jira)` : "Jira",
-    };
 
     // Echo loop guard on comments authored by LOOMA itself
     if (body.comment) {
@@ -443,25 +718,29 @@ export class JiraSyncService {
       }
     }
 
-    const jiraStatus = body.issue?.fields?.status?.name;
+    const fields = body.issue?.fields ?? {};
+    const jiraStatus = fields.status?.name;
     const mappedStatus = jiraStatus && config ? this.mapJiraStatusToLooma(config, jiraStatus) : undefined;
-    const nextPriority = body.issue?.fields?.priority?.name
-      ? JIRA_TO_LOOMA_PRIORITY[body.issue.fields.priority.name.toLowerCase()]
+    const nextPriority = fields.priority?.name
+      ? JIRA_TO_LOOMA_PRIORITY[fields.priority.name.toLowerCase()]
       : undefined;
+    const agentHint = extractLogicalAgentHint(fields, config);
+    const matchedBot = agentHint && this.resolveRoomBot ? this.resolveRoomBot(task.roomId, agentHint) : undefined;
 
     const candidateFingerprint = taskSyncFingerprint({
       title: task.title,
       status: mappedStatus ?? task.status,
       priority: nextPriority ?? task.priority,
-      assigneeName: task.assigneeName,
-      assigneeRole: task.assigneeRole,
+      assigneeName: matchedBot?.name ?? task.assigneeName,
+      assigneeRole: matchedBot?.title ?? task.assigneeRole,
     });
 
     // Loop prevention: if resulting state equals the state LOOMA just pushed, skip re-applying status.
     if (
       task.jiraSync?.lastSyncedFingerprint === candidateFingerprint &&
       mappedStatus === task.status &&
-      (!nextPriority || nextPriority === task.priority)
+      (!nextPriority || nextPriority === task.priority) &&
+      (!matchedBot || matchedBot.id === task.assigneeBotId)
     ) {
       if (remoteUpdatedMs > 0) {
         this.store.setJiraSyncState(task.id, { lastRemoteUpdatedAt: remoteUpdatedMs, lastSyncDirection: "pull" });
@@ -469,34 +748,7 @@ export class JiraSyncService {
       return { handled: Boolean(body.comment), ignoredReason: body.comment ? undefined : "No state delta (echo prevented)", task: this.store.get(task.id) };
     }
 
-    if (nextPriority && nextPriority !== task.priority) {
-      this.store.update(task.id, { priority: nextPriority }, jiraActor);
-    }
-
-    if (mappedStatus && mappedStatus !== task.status) {
-      try {
-        this.store.transition(task.id, mappedStatus, jiraActor, {
-          message: `Synced from Jira (${issueKey}: ${jiraStatus})`,
-          activityType: "jira-synced",
-        });
-      } catch {
-        // Record error without throwing or corrupting task if Jira sent an invalid workflow jump
-        this.store.addActivity(
-          task.id,
-          { type: "jira-synced", message: `Ignored invalid Jira transition "${task.status}" -> "${mappedStatus}" from ${issueKey}` },
-          jiraActor,
-        );
-      }
-    }
-
-    const refreshed = this.store.get(task.id)!;
-    this.store.setJiraSyncState(refreshed.id, {
-      lastSyncedAt: this.now(),
-      lastRemoteUpdatedAt: remoteUpdatedMs || this.now(),
-      lastSyncedFingerprint: taskSyncFingerprint(refreshed),
-      lastSyncDirection: "pull",
-      lastError: undefined,
-    });
+    this.applyRemoteFieldsToTask(task, issueKey, fields, config, jiraActor);
     return { handled: true, task: this.store.get(task.id) };
   }
 }

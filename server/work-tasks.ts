@@ -8,6 +8,7 @@ import {
   AGENT_TASK_STATUSES,
   AGENT_TASK_TYPES,
   canActorTransitionWorkTask,
+  isTaskOverBudget,
   type AgentTask,
   type AgentTaskEvidence,
   type AgentTaskEvidenceType,
@@ -17,8 +18,10 @@ import {
   type AgentTaskStatus,
   type AgentTaskType,
   type RoomJiraPublicConfig,
+  type RoomTimelineEvent,
   type TaskActivity,
   type TaskActivityType,
+  type TelegramBridgePublicConfig,
 } from "../shared/work-tasks.ts";
 import { redactSecretsInText } from "../shared/redact.ts";
 import { writeFileAtomic } from "./atomic.ts";
@@ -46,6 +49,19 @@ export interface RoomJiraStoredConfig {
   lastError?: string;
 }
 
+export interface TelegramBridgeStoredConfig {
+  enabled: boolean;
+  botUsername?: string;
+  allowedChatIds: string[];
+  notifyOnBlocked: boolean;
+  notifyOnBudgetExceeded: boolean;
+  notifyOnDone: boolean;
+  notifyOnRework: boolean;
+  allowRemoteActions: boolean;
+  lastPollAt?: number;
+  lastError?: string;
+}
+
 export interface CreateWorkTaskInput {
   roomId: string;
   parentTaskId?: string;
@@ -59,6 +75,8 @@ export interface CreateWorkTaskInput {
   assigneeName?: string;
   assigneeRole?: string;
   qaBotId?: string;
+  autoQa?: boolean;
+  budgetUsd?: number;
   acceptanceCriteria?: string[];
   labels?: string[];
   dueAt?: number;
@@ -83,6 +101,8 @@ export interface UpdateWorkTaskInput {
   assigneeName?: string | null;
   assigneeRole?: string | null;
   qaBotId?: string | null;
+  autoQa?: boolean;
+  budgetUsd?: number | null;
   acceptanceCriteria?: string[];
   labels?: string[];
   dueAt?: number | null;
@@ -151,6 +171,16 @@ const jiraSyncSchema = z.object({
   lastSyncDirection: z.enum(["push", "pull"]).optional(),
 });
 
+const usageSchema = z.object({
+  inputTokens: z.number().nonnegative(),
+  outputTokens: z.number().nonnegative(),
+  cachedInputTokens: z.number().nonnegative(),
+  costUsd: z.number().nonnegative(),
+  turns: z.number().int().nonnegative(),
+  lastModel: z.string().optional(),
+  lastUpdatedAt: z.number().finite().optional(),
+});
+
 const taskSchema = z.object({
   id: z.string().min(1),
   key: z.string().min(1),
@@ -176,6 +206,11 @@ const taskSchema = z.object({
   assigneeName: z.string().optional(),
   assigneeRole: z.string().optional(),
   qaBotId: z.string().optional(),
+  autoQa: z.boolean().optional(),
+  qaThreadId: z.string().optional(),
+  reworkCount: z.number().int().nonnegative().optional(),
+  budgetUsd: z.number().finite().positive().optional(),
+  usage: usageSchema.optional(),
   reporterType: z.enum(["user", "agent", "system"]),
   reporterId: z.string().optional(),
   acceptanceCriteria: z.array(z.string().max(1000)).optional(),
@@ -204,6 +239,7 @@ const activitySchema = z.object({
   type: z.enum([
     "created",
     "assigned",
+    "dispatched",
     "status-changed",
     "progress",
     "comment",
@@ -211,6 +247,7 @@ const activitySchema = z.object({
     "blocked",
     "reviewed",
     "jira-synced",
+    "budget-exceeded",
     "error",
   ]),
   actorType: z.enum(["user", "agent", "system"]),
@@ -220,6 +257,10 @@ const activitySchema = z.object({
   message: z.string().min(1).max(4000),
   fromStatus: taskSchema.shape.status.optional(),
   toStatus: taskSchema.shape.status.optional(),
+  durationMs: z.number().finite().nonnegative().optional(),
+  costUsd: z.number().finite().nonnegative().optional(),
+  tokens: z.number().finite().nonnegative().optional(),
+  threadId: z.string().optional(),
   createdAt: z.number().finite(),
 });
 
@@ -236,12 +277,26 @@ const roomJiraConfigSchema = z.object({
   lastError: z.string().optional(),
 });
 
+const telegramConfigSchema = z.object({
+  enabled: z.boolean().default(false),
+  botUsername: z.string().optional(),
+  allowedChatIds: z.array(z.string()).default([]),
+  notifyOnBlocked: z.boolean().default(true),
+  notifyOnBudgetExceeded: z.boolean().default(true),
+  notifyOnDone: z.boolean().default(true),
+  notifyOnRework: z.boolean().default(true),
+  allowRemoteActions: z.boolean().default(true),
+  lastPollAt: z.number().finite().optional(),
+  lastError: z.string().optional(),
+});
+
 const fileSchema = z.object({
   version: z.literal(1),
   seq: z.number().int().nonnegative(),
   tasks: z.array(taskSchema),
   activities: z.array(activitySchema),
   jiraConfigs: z.record(z.string(), roomJiraConfigSchema).optional(),
+  telegramConfig: telegramConfigSchema.optional(),
 });
 
 const secretsFileSchema = z.object({
@@ -278,6 +333,7 @@ export class WorkTaskStore {
   private readonly now: () => number;
   private readonly emit?: (frame: ServerFrame) => void;
   private readonly onTaskMutated?: (task: AgentTask, reason: string) => void;
+  private readonly activityListeners = new Set<(task: AgentTask, activity: TaskActivity) => void>();
   private data: PersistedWorkTasks;
   private tokens: Record<string, string> = {};
   private readable = true;
@@ -290,6 +346,13 @@ export class WorkTaskStore {
     this.onTaskMutated = options.onTaskMutated;
     this.data = this.load();
     this.tokens = this.loadSecrets();
+  }
+
+  subscribeActivity(listener: (task: AgentTask, activity: TaskActivity) => void): () => void {
+    this.activityListeners.add(listener);
+    return () => {
+      this.activityListeners.delete(listener);
+    };
   }
 
   private load(): PersistedWorkTasks {
@@ -346,6 +409,18 @@ export class WorkTaskStore {
       taskId: activity.taskId,
       activity: structuredClone(activity),
     });
+    if (this.activityListeners.size > 0) {
+      const task = this.get(activity.taskId);
+      if (task) {
+        for (const listener of this.activityListeners) {
+          try {
+            listener(structuredClone(task), structuredClone(activity));
+          } catch (err) {
+            console.warn("[work-tasks] activity listener error:", err);
+          }
+        }
+      }
+    }
   }
 
   private recordActivity(
@@ -356,6 +431,10 @@ export class WorkTaskStore {
       message: string;
       fromStatus?: AgentTaskStatus;
       toStatus?: AgentTaskStatus;
+      durationMs?: number;
+      costUsd?: number;
+      tokens?: number;
+      threadId?: string;
       at?: number;
     },
   ): TaskActivity {
@@ -371,6 +450,10 @@ export class WorkTaskStore {
       message: cleanText(input.message, 4000) || input.type,
       ...(input.fromStatus ? { fromStatus: input.fromStatus } : {}),
       ...(input.toStatus ? { toStatus: input.toStatus } : {}),
+      ...(typeof input.durationMs === "number" && Number.isFinite(input.durationMs) ? { durationMs: input.durationMs } : {}),
+      ...(typeof input.costUsd === "number" && Number.isFinite(input.costUsd) ? { costUsd: input.costUsd } : {}),
+      ...(typeof input.tokens === "number" && Number.isFinite(input.tokens) ? { tokens: input.tokens } : {}),
+      ...(input.threadId ? { threadId: input.threadId } : {}),
       createdAt: input.at ?? this.now(),
     };
     this.data.activities.push(activity);
@@ -405,7 +488,7 @@ export class WorkTaskStore {
   }
 
   findByThreadId(threadId: string): AgentTask | undefined {
-    const matches = this.data.tasks.filter((t) => t.threadId === threadId);
+    const matches = this.data.tasks.filter((t) => t.threadId === threadId || t.qaThreadId === threadId);
     if (!matches.length) return undefined;
     // Prefer active non-terminal tasks if multiple tasks ever shared a standing thread.
     const active = matches.find((t) => !["done", "cancelled"].includes(t.status)) ?? matches[matches.length - 1]!;
@@ -522,6 +605,10 @@ export class WorkTaskStore {
       ...(input.assigneeName ? { assigneeName: cleanText(input.assigneeName, 120) } : {}),
       ...(input.assigneeRole ? { assigneeRole: cleanText(input.assigneeRole, 120) } : {}),
       ...(input.qaBotId ? { qaBotId: input.qaBotId } : {}),
+      ...(typeof input.autoQa === "boolean" ? { autoQa: input.autoQa } : {}),
+      ...(typeof input.budgetUsd === "number" && Number.isFinite(input.budgetUsd) && input.budgetUsd > 0
+        ? { budgetUsd: input.budgetUsd }
+        : {}),
       reporterType: actor.actorType,
       ...(actor.actorId ? { reporterId: actor.actorId } : {}),
       ...(input.acceptanceCriteria?.length
@@ -783,6 +870,14 @@ export class WorkTaskStore {
     }
     if (patch.coordinatorBotId !== undefined) current.coordinatorBotId = patch.coordinatorBotId ?? undefined;
     if (patch.qaBotId !== undefined) current.qaBotId = patch.qaBotId ?? undefined;
+    if (patch.autoQa !== undefined) current.autoQa = patch.autoQa;
+    if (patch.budgetUsd !== undefined) {
+      current.budgetUsd =
+        patch.budgetUsd !== null && Number.isFinite(patch.budgetUsd) && patch.budgetUsd > 0
+          ? patch.budgetUsd
+          : undefined;
+      fieldChanges.push(current.budgetUsd ? `budget=$${current.budgetUsd}` : "budget=none");
+    }
     if (patch.acceptanceCriteria !== undefined) {
       current.acceptanceCriteria = patch.acceptanceCriteria.map((c) => cleanText(c, 1000)).filter(Boolean);
     }
@@ -828,23 +923,122 @@ export class WorkTaskStore {
 
   bindRuntime(
     idOrKey: string,
-    binding: { threadId?: string; assignmentId?: string; coordinatorBotId?: string },
+    binding: { threadId?: string; qaThreadId?: string; assignmentId?: string; coordinatorBotId?: string; reworkCount?: number },
   ): AgentTask | undefined {
     const idx = this.findIndex(idOrKey);
     if (idx < 0) return undefined;
     const task = this.data.tasks[idx]!;
     if (binding.threadId) task.threadId = binding.threadId;
+    if (binding.qaThreadId) task.qaThreadId = binding.qaThreadId;
     if (binding.assignmentId) task.assignmentId = binding.assignmentId;
     if (binding.coordinatorBotId && !task.coordinatorBotId) task.coordinatorBotId = binding.coordinatorBotId;
+    if (typeof binding.reworkCount === "number" && Number.isFinite(binding.reworkCount)) {
+      task.reworkCount = Math.max(0, Math.floor(binding.reworkCount));
+    }
     task.updatedAt = this.now();
     this.save();
     this.broadcastTask(task);
     return structuredClone(task);
   }
 
+  recordUsage(
+    idOrKey: string,
+    delta: {
+      inputTokens: number;
+      outputTokens: number;
+      cachedInputTokens?: number;
+      costUsd: number;
+      model?: string;
+      botId?: string;
+      botName?: string;
+      threadId?: string;
+      durationMs?: number;
+    },
+  ): { task: AgentTask; exceededNow: boolean } | undefined {
+    const idx = this.findIndex(idOrKey);
+    if (idx < 0) return undefined;
+    const task = this.data.tasks[idx]!;
+    const wasOver = isTaskOverBudget(task);
+    const now = this.now();
+    const prev = task.usage ?? {
+      inputTokens: 0,
+      outputTokens: 0,
+      cachedInputTokens: 0,
+      costUsd: 0,
+      turns: 0,
+    };
+    const addIn = Math.max(0, Math.round(delta.inputTokens || 0));
+    const addOut = Math.max(0, Math.round(delta.outputTokens || 0));
+    const addCached = Math.max(0, Math.round(delta.cachedInputTokens || 0));
+    const addCost = Math.max(0, Number.isFinite(delta.costUsd) ? delta.costUsd : 0);
+
+    task.usage = {
+      inputTokens: prev.inputTokens + addIn,
+      outputTokens: prev.outputTokens + addOut,
+      cachedInputTokens: prev.cachedInputTokens + addCached,
+      costUsd: Number((prev.costUsd + addCost).toFixed(6)),
+      turns: prev.turns + 1,
+      ...(delta.model ? { lastModel: delta.model } : prev.lastModel ? { lastModel: prev.lastModel } : {}),
+      lastUpdatedAt: now,
+    };
+    task.updatedAt = now;
+
+    const exceededNow = !wasOver && isTaskOverBudget(task);
+    let exceededAct: TaskActivity | undefined;
+    if (exceededNow && task.budgetUsd !== undefined) {
+      const reason = `Task budget exceeded ($${task.usage.costUsd.toFixed(4)} / $${task.budgetUsd.toFixed(2)})`;
+      task.needsUserAction = true;
+      task.needsUserReason = reason;
+      exceededAct = this.recordActivity(task, {
+        type: "budget-exceeded",
+        actor: {
+          actorType: "system",
+          actorId: delta.botId,
+          actorName: delta.botName || "Budget Guard",
+        },
+        message: reason,
+        costUsd: task.usage.costUsd,
+        tokens: task.usage.inputTokens + task.usage.outputTokens,
+        threadId: delta.threadId ?? task.threadId,
+        durationMs: delta.durationMs,
+        at: now,
+      });
+    }
+
+    this.save();
+    this.broadcastTask(task);
+    if (exceededAct) this.broadcastActivity(exceededAct);
+    return { task: structuredClone(task), exceededNow };
+  }
+
+  listRoomTimeline(roomId: string, limit = 150): RoomTimelineEvent[] {
+    const taskById = new Map(this.data.tasks.filter((t) => t.roomId === roomId).map((t) => [t.id, t]));
+    const items: RoomTimelineEvent[] = [];
+    for (let i = this.data.activities.length - 1; i >= 0 && items.length < limit; i--) {
+      const act = this.data.activities[i]!;
+      if (act.roomId !== roomId) continue;
+      const task = taskById.get(act.taskId);
+      items.push({
+        ...structuredClone(act),
+        taskKey: task?.key ?? act.taskId.slice(0, 8),
+        taskTitle: task?.title ?? "",
+        taskStatus: task?.status ?? act.toStatus ?? "todo",
+        ...(task?.assigneeBotId ? { assigneeBotId: task.assigneeBotId } : {}),
+      });
+    }
+    return items;
+  }
+
   addActivity(
     idOrKey: string,
-    input: { type?: TaskActivityType; message: string },
+    input: {
+      type?: TaskActivityType;
+      message: string;
+      durationMs?: number;
+      costUsd?: number;
+      tokens?: number;
+      threadId?: string;
+    },
     actor: WorkTaskActor,
   ): AgentTask {
     const idx = this.findIndex(idOrKey);
@@ -868,6 +1062,10 @@ export class WorkTaskStore {
       type: input.type ?? "comment",
       actor,
       message: msg,
+      durationMs: input.durationMs,
+      costUsd: input.costUsd,
+      tokens: input.tokens,
+      threadId: input.threadId,
       at: now,
     });
     this.save();
@@ -1039,6 +1237,92 @@ export class WorkTaskStore {
       this.saveSecrets();
     }
     return this.getRoomJiraConfig(roomId);
+  }
+
+  private defaultTelegramConfig(): TelegramBridgeStoredConfig {
+    return {
+      enabled: false,
+      allowedChatIds: [],
+      notifyOnBlocked: true,
+      notifyOnBudgetExceeded: true,
+      notifyOnDone: true,
+      notifyOnRework: true,
+      allowRemoteActions: true,
+    };
+  }
+
+  getTelegramConfig(): TelegramBridgePublicConfig {
+    const stored = this.data.telegramConfig ?? this.defaultTelegramConfig();
+    return {
+      enabled: stored.enabled,
+      hasBotToken: Boolean(this.tokens.__telegram_bot__),
+      ...(stored.botUsername ? { botUsername: stored.botUsername } : {}),
+      allowedChatIds: [...stored.allowedChatIds],
+      notifyOnBlocked: stored.notifyOnBlocked,
+      notifyOnBudgetExceeded: stored.notifyOnBudgetExceeded,
+      notifyOnDone: stored.notifyOnDone,
+      notifyOnRework: stored.notifyOnRework,
+      allowRemoteActions: stored.allowRemoteActions,
+      ...(stored.lastPollAt ? { lastPollAt: stored.lastPollAt } : {}),
+      ...(stored.lastError ? { lastError: stored.lastError } : {}),
+    };
+  }
+
+  getTelegramSecrets(): { config: TelegramBridgeStoredConfig; botToken?: string } {
+    const stored = this.data.telegramConfig ?? this.defaultTelegramConfig();
+    return {
+      config: structuredClone(stored),
+      ...(this.tokens.__telegram_bot__ ? { botToken: this.tokens.__telegram_bot__ } : {}),
+    };
+  }
+
+  saveTelegramConfig(
+    input: Partial<TelegramBridgeStoredConfig> & { botToken?: string | null },
+  ): TelegramBridgePublicConfig {
+    const existing = this.data.telegramConfig ?? this.defaultTelegramConfig();
+    const cleanedChats = input.allowedChatIds !== undefined
+      ? [...new Set(input.allowedChatIds.map((id) => id.trim()).filter(Boolean))]
+      : existing.allowedChatIds;
+    const next: TelegramBridgeStoredConfig = {
+      enabled: input.enabled ?? existing.enabled,
+      ...(input.botUsername !== undefined
+        ? input.botUsername.trim()
+          ? { botUsername: input.botUsername.trim() }
+          : {}
+        : existing.botUsername
+          ? { botUsername: existing.botUsername }
+          : {}),
+      allowedChatIds: cleanedChats,
+      notifyOnBlocked: input.notifyOnBlocked ?? existing.notifyOnBlocked,
+      notifyOnBudgetExceeded: input.notifyOnBudgetExceeded ?? existing.notifyOnBudgetExceeded,
+      notifyOnDone: input.notifyOnDone ?? existing.notifyOnDone,
+      notifyOnRework: input.notifyOnRework ?? existing.notifyOnRework,
+      allowRemoteActions: input.allowRemoteActions ?? existing.allowRemoteActions,
+      ...(input.lastPollAt !== undefined
+        ? { lastPollAt: input.lastPollAt }
+        : existing.lastPollAt
+          ? { lastPollAt: existing.lastPollAt }
+          : {}),
+      ...(input.lastError !== undefined
+        ? input.lastError
+          ? { lastError: input.lastError }
+          : {}
+        : existing.lastError
+          ? { lastError: existing.lastError }
+          : {}),
+    };
+    this.data.telegramConfig = next;
+    this.save();
+
+    if (input.botToken !== undefined) {
+      if (input.botToken === null || input.botToken === "") {
+        delete this.tokens.__telegram_bot__;
+      } else {
+        this.tokens.__telegram_bot__ = input.botToken.trim();
+      }
+      this.saveSecrets();
+    }
+    return this.getTelegramConfig();
   }
 
   /** Evaluates Telegram Bridge control-plane commands (`/tasks`, `/task`, `/blocked`, `/status`). */

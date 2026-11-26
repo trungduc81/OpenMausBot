@@ -14,12 +14,21 @@ import type { json as sendJson } from "../harness/http.ts";
 import type { RequestAuth } from "../request-auth.ts";
 import type { BotRecord, GroupRecord } from "../store.ts";
 import type { JiraSyncService } from "../work-tasks-jira.ts";
+import {
+  dispatchWorkTaskRun,
+  maybeTriggerAutoQaReview,
+  maybeTriggerAutoRework,
+  type WorkTaskDispatcher,
+} from "../work-tasks-runtime.ts";
+import type { TelegramBridgeService } from "../work-tasks-telegram.ts";
 import { WorkTaskError, type WorkTaskActor, type WorkTaskStore } from "../work-tasks.ts";
 import { PASS, type RouteContext, type RouteHandler } from "./table.ts";
 
 export interface WorkTaskRouteDeps {
   tasks: WorkTaskStore;
   jira: JiraSyncService;
+  telegram?: TelegramBridgeService;
+  dispatcher?: WorkTaskDispatcher;
   group: (id: string) => GroupRecord | undefined;
   groups: () => readonly GroupRecord[];
   groupByThread: (threadId: string) => GroupRecord | undefined;
@@ -60,11 +69,13 @@ function maybeTriggerJiraAutoSync(
   if (!task?.jiraSync?.issueKey) return;
   const cfg = tasks.getRoomJiraConfig(task.roomId);
   if (!cfg.enabled || !cfg.autoSync) return;
-  void jira.syncTaskToJira(task.id, comment?.message, comment?.actor).catch(() => {});
+  void jira.syncTaskToJira(task.id, comment?.message, comment?.actor).catch((err) => {
+    console.warn(`[work-tasks] Jira auto-sync failed for ${task.key}:`, err instanceof Error ? err.message : err);
+  });
 }
 
 export function createWorkTaskRoutes(deps: WorkTaskRouteDeps): RouteHandler {
-  const { tasks, jira, group, groups, bot, visible, actorName } = deps;
+  const { tasks, jira, telegram, dispatcher, group, groups, bot, visible, actorName } = deps;
 
   return async ({ req, res, url, path, method, auth, json, readBody }: RouteContext) => {
     if (!path.startsWith("/api/work-tasks")) return PASS;
@@ -81,6 +92,34 @@ export function createWorkTaskRoutes(deps: WorkTaskRouteDeps): RouteHandler {
         const body = await readBody(req);
         const result = jira.handleWebhook(body);
         return json(res, 200, result);
+      }
+
+      // Telegram Bridge Config & Connection Test
+      if (path === "/api/work-tasks/telegram/config" && method === "GET") {
+        return json(res, 200, { config: tasks.getTelegramConfig() });
+      }
+
+      if (path === "/api/work-tasks/telegram/config" && method === "PUT") {
+        const body = (await readBody(req)) as Record<string, unknown> | null;
+        if (!body || typeof body !== "object") return json(res, 400, { error: "Expected JSON body" });
+        const saved = tasks.saveTelegramConfig({
+          ...(typeof body.enabled === "boolean" ? { enabled: body.enabled } : {}),
+          ...(Array.isArray(body.allowedChatIds) ? { allowedChatIds: body.allowedChatIds.map(String) } : {}),
+          ...(typeof body.notifyOnBlocked === "boolean" ? { notifyOnBlocked: body.notifyOnBlocked } : {}),
+          ...(typeof body.notifyOnBudgetExceeded === "boolean" ? { notifyOnBudgetExceeded: body.notifyOnBudgetExceeded } : {}),
+          ...(typeof body.notifyOnDone === "boolean" ? { notifyOnDone: body.notifyOnDone } : {}),
+          ...(typeof body.notifyOnRework === "boolean" ? { notifyOnRework: body.notifyOnRework } : {}),
+          ...(typeof body.allowRemoteActions === "boolean" ? { allowRemoteActions: body.allowRemoteActions } : {}),
+          ...(body.botToken === null || typeof body.botToken === "string" ? { botToken: body.botToken } : {}),
+        });
+        telegram?.reload();
+        return json(res, 200, { config: saved });
+      }
+
+      if (path === "/api/work-tasks/telegram/test" && method === "POST") {
+        if (!telegram) return json(res, 503, { ok: false, error: "Telegram bridge service is not available." });
+        const result = await telegram.testConnection();
+        return json(res, result.ok ? 200 : 502, { ...result, config: tasks.getTelegramConfig() });
       }
 
       // Telegram Bridge Control Plane
@@ -103,6 +142,23 @@ export function createWorkTaskRoutes(deps: WorkTaskRouteDeps): RouteHandler {
           .filter((g) => !g.dm && seen.group(g.id))
           .map((g) => ({ id: g.id, name: g.name }));
         return json(res, 200, tasks.formatTelegramCommand(cmd, visibleRooms, roomId));
+      }
+
+      // Per-room Execution Timeline
+      const timelineMatch = path.match(/^\/api\/work-tasks\/rooms\/([\w-]+)\/timeline$/);
+      if (timelineMatch && method === "GET") {
+        const roomId = timelineMatch[1]!;
+        const room = group(roomId);
+        if (!room || !seen.group(roomId)) return json(res, 404, { error: "no such room" });
+        const limitRaw = Number(url.searchParams.get("limit") ?? 150);
+        const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(500, Math.floor(limitRaw)) : 150;
+        const events = tasks.listRoomTimeline(roomId, limit);
+        const allRoomTasks = tasks.list({ roomId });
+        const members = room.memberIds
+          .map((id) => bot(id))
+          .filter((b): b is BotRecord => Boolean(b))
+          .map((b) => ({ id: b.id, name: b.name, ...(b.title ? { title: b.title } : {}), busy: Boolean(b.busy) }));
+        return json(res, 200, { events, overview: computeRoomTaskOverview(allRoomTasks, members) });
       }
 
       // Per-room Jira config
@@ -203,6 +259,10 @@ export function createWorkTaskRoutes(deps: WorkTaskRouteDeps): RouteHandler {
             assigneeName: typeof body.assigneeName === "string" ? body.assigneeName : assigneeBot?.name,
             assigneeRole: typeof body.assigneeRole === "string" ? body.assigneeRole : assigneeBot?.title,
             ...(typeof body.qaBotId === "string" && body.qaBotId ? { qaBotId: body.qaBotId } : {}),
+            ...(typeof body.autoQa === "boolean" ? { autoQa: body.autoQa } : {}),
+            ...(typeof body.budgetUsd === "number" && Number.isFinite(body.budgetUsd) && body.budgetUsd > 0
+              ? { budgetUsd: body.budgetUsd }
+              : {}),
             ...(Array.isArray(body.acceptanceCriteria) ? { acceptanceCriteria: body.acceptanceCriteria.map(String) } : {}),
             ...(Array.isArray(body.labels) ? { labels: body.labels.map(String) } : {}),
             ...(typeof body.dueAt === "number" ? { dueAt: body.dueAt } : {}),
@@ -214,11 +274,20 @@ export function createWorkTaskRoutes(deps: WorkTaskRouteDeps): RouteHandler {
           },
           userActor,
         );
+        if (created.task.type === "subtask" && created.task.parentTaskId) {
+          const parent = tasks.get(created.task.parentTaskId);
+          const cfg = tasks.getRoomJiraConfig(roomId);
+          if (parent?.jiraSync?.issueKey && cfg.enabled && cfg.autoSync) {
+            void jira.createIssueForTask(created.task.id).catch((err) => {
+              console.warn(`[work-tasks] Jira subtask auto-create failed for ${created.task.key}:`, err instanceof Error ? err.message : err);
+            });
+          }
+        }
         return json(res, 201, created);
       }
 
       // Single task routes
-      const taskMatch = path.match(/^\/api\/work-tasks\/([\w-]+)(?:\/(comments|evidence|jira\/create|jira\/link|jira\/sync))?$/);
+      const taskMatch = path.match(/^\/api\/work-tasks\/([\w-]+)(?:\/(run|qa|comments|evidence|jira\/create|jira\/link|jira\/sync|jira\/pull))?$/);
       if (!taskMatch) return PASS;
       const idOrKey = taskMatch[1]!;
       const sub = taskMatch[2];
@@ -267,6 +336,8 @@ export function createWorkTaskRoutes(deps: WorkTaskRouteDeps): RouteHandler {
                 }
               : {}),
             ...(body.qaBotId === null || typeof body.qaBotId === "string" ? { qaBotId: body.qaBotId } : {}),
+            ...(typeof body.autoQa === "boolean" ? { autoQa: body.autoQa } : {}),
+            ...(body.budgetUsd === null || typeof body.budgetUsd === "number" ? { budgetUsd: body.budgetUsd } : {}),
             ...(Array.isArray(body.acceptanceCriteria) ? { acceptanceCriteria: body.acceptanceCriteria.map(String) } : {}),
             ...(Array.isArray(body.labels) ? { labels: body.labels.map(String) } : {}),
             ...(body.dueAt === null || typeof body.dueAt === "number" ? { dueAt: body.dueAt } : {}),
@@ -281,7 +352,61 @@ export function createWorkTaskRoutes(deps: WorkTaskRouteDeps): RouteHandler {
           userActor,
         );
         maybeTriggerJiraAutoSync(tasks, jira, updated);
+        if (dispatcher && updated.status !== existing.status) {
+          if (updated.status === "in-review") {
+            void maybeTriggerAutoQaReview({
+              workTasks: tasks,
+              jira,
+              group,
+              botLookup: bot,
+              dispatcher,
+              taskId: updated.id,
+            });
+          } else if (updated.status === "rework" && existing.status === "in-review") {
+            void maybeTriggerAutoRework({
+              workTasks: tasks,
+              jira,
+              group,
+              botLookup: bot,
+              dispatcher,
+              taskId: updated.id,
+              reason: typeof body.statusNote === "string" ? body.statusNote : undefined,
+            });
+          }
+        }
         return json(res, 200, { task: updated });
+      }
+
+      if (sub === "run" && method === "POST") {
+        if (!dispatcher) return json(res, 503, { error: "Task runtime dispatcher is not available." });
+        const body = (await readBody(req).catch(() => null)) as Record<string, unknown> | null;
+        const result = await dispatchWorkTaskRun({
+          workTasks: tasks,
+          jira,
+          group,
+          botLookup: bot,
+          dispatcher,
+          taskId: existing.id,
+          actor: userActor,
+          ...(typeof body?.botId === "string" && body.botId ? { botIdOverride: body.botId } : {}),
+          ...(typeof body?.prompt === "string" && body.prompt ? { extraPrompt: body.prompt } : {}),
+          ...(body?.force === true ? { force: true } : {}),
+        });
+        return json(res, result.ok ? 200 : 409, result);
+      }
+
+      if (sub === "qa" && method === "POST") {
+        if (!dispatcher) return json(res, 503, { error: "Task runtime dispatcher is not available." });
+        const result = await maybeTriggerAutoQaReview({
+          workTasks: tasks,
+          jira,
+          group,
+          botLookup: bot,
+          dispatcher,
+          taskId: existing.id,
+          force: true,
+        });
+        return json(res, result.dispatched ? 200 : 409, result);
       }
 
       if (!sub && method === "DELETE") {
@@ -327,6 +452,11 @@ export function createWorkTaskRoutes(deps: WorkTaskRouteDeps): RouteHandler {
         return json(res, out.ok ? 200 : 502, out);
       }
 
+      if (sub === "jira/pull" && method === "POST") {
+        const out = await jira.pullFromJira(existing.id);
+        return json(res, out.ok ? 200 : 502, out);
+      }
+
       return PASS;
     } catch (error) {
       if (error instanceof WorkTaskError) {
@@ -348,6 +478,7 @@ export interface InternalWorkTaskContext {
   readBody: () => Promise<unknown>;
   tasks: WorkTaskStore;
   jira: JiraSyncService;
+  dispatcher?: WorkTaskDispatcher;
   group: (id: string) => GroupRecord | undefined;
   groupByThread: (threadId: string) => GroupRecord | undefined;
   groups: () => readonly GroupRecord[];
@@ -360,7 +491,7 @@ export interface InternalWorkTaskContext {
  * the authenticated `internalCapability` (`ctx.bot`, `ctx.threadId`), never from body parameters.
  */
 export async function handleInternalWorkTaskRoute(ctx: InternalWorkTaskContext): Promise<typeof PASS | void> {
-  const { method, path, url, res, json, bot, threadId, readBody, tasks, jira, group, groupByThread, groups, botLookup } = ctx;
+  const { method, path, url, res, json, bot, threadId, readBody, tasks, jira, dispatcher, group, groupByThread, groups, botLookup } = ctx;
   if (!path.startsWith("/api/internal/work-tasks")) return PASS;
 
   const sourceRoom = groupByThread(threadId);
@@ -486,10 +617,35 @@ export async function handleInternalWorkTaskRoute(ctx: InternalWorkTaskContext):
             error: "Cannot move task to review/done while child subtasks are still in progress.",
           });
         }
+        const prevStatus = latest.status;
+        const statusNote = typeof body.statusNote === "string" ? body.statusNote : typeof body.comment === "string" ? body.comment : undefined;
         latest = tasks.transition(latest.id, nextStatus, actor, {
-          message: typeof body.statusNote === "string" ? body.statusNote : typeof body.comment === "string" ? body.comment : undefined,
+          message: statusNote,
         });
         maybeTriggerJiraAutoSync(tasks, jira, latest);
+        if (dispatcher) {
+          if (nextStatus === "in-review") {
+            void maybeTriggerAutoQaReview({
+              workTasks: tasks,
+              jira,
+              group,
+              botLookup,
+              dispatcher,
+              taskId: latest.id,
+              workerSummary: statusNote,
+            });
+          } else if (nextStatus === "rework" && prevStatus === "in-review") {
+            void maybeTriggerAutoRework({
+              workTasks: tasks,
+              jira,
+              group,
+              botLookup,
+              dispatcher,
+              taskId: latest.id,
+              reason: statusNote,
+            });
+          }
+        }
       }
 
       if (typeof body.progress === "string" && body.progress.trim()) {

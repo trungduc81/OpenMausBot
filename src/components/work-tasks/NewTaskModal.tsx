@@ -9,7 +9,7 @@ import {
   type AgentTaskPriority,
   type AgentTaskType,
 } from "../../../shared/work-tasks";
-import { createWorkTask } from "./work-tasks-api";
+import { createWorkTask, runWorkTask } from "./work-tasks-api";
 
 export function NewTaskModal({
   roomId,
@@ -34,11 +34,12 @@ export function NewTaskModal({
   const [criteriaText, setCriteriaText] = useState("");
   const [labelsText, setLabelsText] = useState("");
   const [dueDate, setDueDate] = useState("");
+  const [budgetText, setBudgetText] = useState("");
+  const [autoQa, setAutoQa] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const submit = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const createTask = async (runImmediately: boolean) => {
     if (!title.trim()) return;
     setBusy(true);
     setError(null);
@@ -52,6 +53,7 @@ export function NewTaskModal({
         .map((s) => s.trim())
         .filter(Boolean);
       const dueAt = dueDate ? new Date(`${dueDate}T23:59:59`).getTime() : undefined;
+      const budgetNum = budgetText.trim() ? Number(budgetText.trim()) : undefined;
       const res = await createWorkTask({
         roomId,
         title: title.trim(),
@@ -60,18 +62,30 @@ export function NewTaskModal({
         priority,
         ...(assigneeBotId ? { assigneeBotId } : {}),
         ...(qaBotId ? { qaBotId } : {}),
+        autoQa,
+        ...(budgetNum && Number.isFinite(budgetNum) && budgetNum > 0 ? { budgetUsd: budgetNum } : {}),
         ...(parentTaskId ? { parentTaskId } : {}),
         ...(acceptanceCriteria.length ? { acceptanceCriteria } : {}),
         ...(labels.length ? { labels } : {}),
         ...(dueAt && Number.isFinite(dueAt) ? { dueAt } : {}),
       });
-      onCreated(res.task);
+      let finalTask = res.task;
+      if (runImmediately) {
+        const ran = await runWorkTask(res.task.id);
+        finalTask = ran.task;
+      }
+      onCreated(finalTask);
       onClose();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setBusy(false);
     }
+  };
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    await createTask(false);
   };
 
   return (
@@ -228,6 +242,30 @@ export function NewTaskModal({
           />
         </label>
 
+        <div className="grid grid-cols-2 items-end gap-2.5">
+          <label className="block space-y-1 text-[12px]">
+            <span className="font-medium text-ink-secondary">{t("workTasks.budget.label")}</span>
+            <input
+              type="number"
+              min="0.01"
+              step="0.05"
+              value={budgetText}
+              onChange={(e) => setBudgetText(e.target.value)}
+              placeholder={t("workTasks.budget.placeholder")}
+              className="w-full rounded-lg border border-hairline bg-inset px-2.5 py-1.5 text-ink"
+            />
+          </label>
+          <label className="flex items-center gap-2 pb-1.5 text-[12px] text-ink">
+            <input
+              type="checkbox"
+              checked={autoQa}
+              onChange={(e) => setAutoQa(e.target.checked)}
+              className="rounded border-hairline"
+            />
+            <span>{t("workTasks.autoQa.label")}</span>
+          </label>
+        </div>
+
         <div className="flex justify-end gap-2 pt-2">
           <button
             type="button"
@@ -235,6 +273,14 @@ export function NewTaskModal({
             className="rounded-lg px-3 py-1.5 text-[13px] text-ink-secondary hover:bg-ink/[0.06]"
           >
             {t("common.cancel")}
+          </button>
+          <button
+            type="button"
+            disabled={busy || !title.trim()}
+            onClick={() => void createTask(true)}
+            className="rounded-lg border border-accent bg-accent/15 px-3.5 py-1.5 text-[13px] font-medium text-accent-text hover:bg-accent/25 disabled:opacity-50"
+          >
+            {t("workTasks.action.createAndRun")}
           </button>
           <button
             type="submit"

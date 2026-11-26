@@ -6,8 +6,10 @@ import type {
   AgentTaskStatus,
   AgentTaskType,
   RoomJiraPublicConfig,
+  RoomTimelineEvent,
   RoomWorkTaskOverview,
   TaskActivity,
+  TelegramBridgePublicConfig,
 } from "../../../shared/work-tasks";
 
 export interface WorkTaskListResponse {
@@ -21,8 +23,17 @@ export interface WorkTaskDetailResponse {
   activities: TaskActivity[];
 }
 
+export interface RoomTimelineResponse {
+  events: RoomTimelineEvent[];
+  overview: RoomWorkTaskOverview;
+}
+
 export async function fetchRoomWorkTasks(roomId: string): Promise<WorkTaskListResponse> {
   return api<WorkTaskListResponse>(`/api/work-tasks?roomId=${encodeURIComponent(roomId)}`);
+}
+
+export async function fetchRoomTimeline(roomId: string, limit = 150): Promise<RoomTimelineResponse> {
+  return api<RoomTimelineResponse>(`/api/work-tasks/rooms/${encodeURIComponent(roomId)}/timeline?limit=${limit}`);
 }
 
 export async function fetchWorkTaskDetail(idOrKey: string): Promise<WorkTaskDetailResponse> {
@@ -39,6 +50,8 @@ export async function createWorkTask(input: {
   parentTaskId?: string;
   assigneeBotId?: string;
   qaBotId?: string;
+  autoQa?: boolean;
+  budgetUsd?: number;
   acceptanceCriteria?: string[];
   labels?: string[];
   dueAt?: number;
@@ -62,6 +75,8 @@ export async function updateWorkTask(
     parentTaskId?: string | null;
     assigneeBotId?: string | null;
     qaBotId?: string | null;
+    autoQa?: boolean;
+    budgetUsd?: number | null;
     acceptanceCriteria?: string[];
     labels?: string[];
     dueAt?: number | null;
@@ -74,6 +89,25 @@ export async function updateWorkTask(
   return api(`/api/work-tasks/${encodeURIComponent(idOrKey)}`, {
     method: "PATCH",
     body: JSON.stringify(patch),
+  });
+}
+
+export async function runWorkTask(
+  idOrKey: string,
+  options?: { botId?: string; prompt?: string; force?: boolean },
+): Promise<{ ok: boolean; task: AgentTask; threadId?: string; error?: string }> {
+  return api(`/api/work-tasks/${encodeURIComponent(idOrKey)}/run`, {
+    method: "POST",
+    body: JSON.stringify(options ?? {}),
+  });
+}
+
+export async function triggerWorkTaskQa(
+  idOrKey: string,
+): Promise<{ dispatched: boolean; qaBotId?: string; qaBotName?: string; threadId?: string; reason?: string }> {
+  return api(`/api/work-tasks/${encodeURIComponent(idOrKey)}/qa`, {
+    method: "POST",
+    body: "{}",
   });
 }
 
@@ -133,5 +167,37 @@ export async function linkJiraToTask(
 
 export async function syncJiraForTask(idOrKey: string): Promise<{ ok: boolean; task?: AgentTask; error?: string }> {
   return api(`/api/work-tasks/${encodeURIComponent(idOrKey)}/jira/sync`, { method: "POST", body: "{}" });
+}
+
+export async function pullJiraForTask(idOrKey: string): Promise<{
+  ok: boolean;
+  task?: AgentTask;
+  createdSubtasks: AgentTask[];
+  updatedSubtasks: AgentTask[];
+  error?: string;
+}> {
+  return api(`/api/work-tasks/${encodeURIComponent(idOrKey)}/jira/pull`, { method: "POST", body: "{}" });
+}
+
+export async function fetchTelegramConfig(): Promise<{ config: TelegramBridgePublicConfig }> {
+  return api(`/api/work-tasks/telegram/config`);
+}
+
+export async function saveTelegramConfig(
+  input: Partial<TelegramBridgePublicConfig> & { botToken?: string | null },
+): Promise<{ config: TelegramBridgePublicConfig }> {
+  return api(`/api/work-tasks/telegram/config`, {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
+}
+
+export async function testTelegramConnection(): Promise<{
+  ok: boolean;
+  botUsername?: string;
+  error?: string;
+  config?: TelegramBridgePublicConfig;
+}> {
+  return api(`/api/work-tasks/telegram/test`, { method: "POST", body: "{}" });
 }
 

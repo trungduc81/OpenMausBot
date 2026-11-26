@@ -2,23 +2,29 @@ import { useCallback, useEffect, useState } from "react";
 import {
   AlertTriangle,
   CheckSquare,
+  Coins,
+  Download,
   ExternalLink,
   FileText,
   GitCommit,
   Link2,
   MessageSquare,
+  Play,
   Plus,
   RefreshCw,
   Send,
+  ShieldCheck,
   Trash2,
   X,
 } from "lucide-react";
 import { t } from "@/lib/i18n";
+import { formatTokens } from "@/lib/usage";
 import type { Bot } from "@/state/store";
 import {
   AGENT_TASK_PRIORITIES,
   AGENT_TASK_TYPES,
   WORK_TASK_TRANSITIONS,
+  isTaskOverBudget,
   type AgentTask,
   type AgentTaskEvidenceType,
   type AgentTaskPriority,
@@ -35,7 +41,10 @@ import {
   deleteWorkTask,
   fetchWorkTaskDetail,
   linkJiraToTask,
+  pullJiraForTask,
+  runWorkTask,
   syncJiraForTask,
+  triggerWorkTaskQa,
   updateWorkTask,
 } from "./work-tasks-api";
 
@@ -225,6 +234,54 @@ export function TaskDetailDrawer({
           )}
         </div>
         <div className="flex items-center gap-1">
+          {task && ["backlog", "todo", "rework", "failed", "blocked"].includes(task.status) && (
+            <button
+              type="button"
+              disabled={busy}
+              onClick={async () => {
+                setBusy(true);
+                setError(null);
+                try {
+                  const res = await runWorkTask(task.id);
+                  if (!res.ok && res.error) setError(res.error);
+                  await load();
+                  onTaskUpdated();
+                } catch (err) {
+                  setError(err instanceof Error ? err.message : String(err));
+                } finally {
+                  setBusy(false);
+                }
+              }}
+              className="inline-flex items-center gap-1 rounded-lg bg-accent px-2.5 py-1 text-[12px] font-medium text-white hover:opacity-90 disabled:opacity-50"
+            >
+              <Play size={12} />
+              <span>{t("workTasks.action.runTask")}</span>
+            </button>
+          )}
+          {task && task.status === "in-review" && (
+            <button
+              type="button"
+              disabled={busy}
+              onClick={async () => {
+                setBusy(true);
+                setError(null);
+                try {
+                  const res = await triggerWorkTaskQa(task.id);
+                  if (!res.dispatched && res.reason) setError(res.reason);
+                  await load();
+                  onTaskUpdated();
+                } catch (err) {
+                  setError(err instanceof Error ? err.message : String(err));
+                } finally {
+                  setBusy(false);
+                }
+              }}
+              className="inline-flex items-center gap-1 rounded-lg border border-warning/50 bg-warning/15 px-2.5 py-1 text-[12px] font-medium text-warning hover:bg-warning/25 disabled:opacity-50"
+            >
+              <ShieldCheck size={12} />
+              <span>{t("workTasks.action.sendToQa")}</span>
+            </button>
+          )}
           {task?.threadId && (
             <button
               type="button"
@@ -658,6 +715,73 @@ export function TaskDetailDrawer({
             </div>
           </section>
 
+          {/* Budget, Spend & Auto-QA */}
+          <section className="space-y-2.5 rounded-xl border border-hairline bg-card p-3">
+            <div className="flex items-center justify-between gap-2">
+              <h3 className="inline-flex items-center gap-1.5 text-[12px] font-semibold uppercase tracking-wide text-ink-tertiary">
+                <Coins size={12} />
+                <span>{t("workTasks.budget.spend")} & Auto-QA</span>
+              </h3>
+              {isTaskOverBudget(task) && (
+                <span className="rounded bg-danger/15 px-1.5 py-0.5 text-[10px] font-semibold text-danger">
+                  {t("workTasks.budget.overBudget")}
+                </span>
+              )}
+            </div>
+            <div className="grid grid-cols-2 gap-2 text-[12px]">
+              <div className="rounded-lg bg-inset px-2.5 py-1.5">
+                <div className="text-[10px] text-ink-tertiary">{t("workTasks.budget.spend")}</div>
+                <div className="font-mono font-semibold text-ink">
+                  ${(task.usage?.costUsd ?? 0).toFixed(4)}
+                  {task.usage && (task.usage.inputTokens + task.usage.outputTokens > 0) && (
+                    <span className="ml-1 text-[10px] font-normal text-ink-secondary">
+                      ({formatTokens(task.usage.inputTokens + task.usage.outputTokens)})
+                    </span>
+                  )}
+                </div>
+              </div>
+              <label className="block rounded-lg bg-inset px-2.5 py-1.5">
+                <span className="block text-[10px] text-ink-tertiary">{t("workTasks.budget.label")}</span>
+                <input
+                  type="number"
+                  min="0"
+                  step="0.05"
+                  defaultValue={task.budgetUsd ?? ""}
+                  placeholder={t("workTasks.budget.none")}
+                  onBlur={(e) => {
+                    const val = e.target.value.trim();
+                    const parsed = val ? Number(val) : null;
+                    if (parsed !== (task.budgetUsd ?? null)) {
+                      void handlePatch({ budgetUsd: parsed && Number.isFinite(parsed) && parsed > 0 ? parsed : null });
+                    }
+                  }}
+                  className="w-full bg-transparent font-mono text-[12px] font-semibold text-ink focus:outline-none"
+                />
+              </label>
+            </div>
+            {typeof task.budgetUsd === "number" && task.budgetUsd > 0 && (
+              <div className="h-1.5 w-full overflow-hidden rounded-full bg-raised">
+                <div
+                  className={
+                    isTaskOverBudget(task)
+                      ? "h-full bg-danger transition-all"
+                      : "h-full bg-accent transition-all"
+                  }
+                  style={{ width: `${Math.min(100, ((task.usage?.costUsd ?? 0) / task.budgetUsd) * 100)}%` }}
+                />
+              </div>
+            )}
+            <label className="flex items-center justify-between gap-2 text-[12px] text-ink">
+              <span>{t("workTasks.autoQa.label")}</span>
+              <input
+                type="checkbox"
+                checked={task.autoQa !== false}
+                disabled={busy}
+                onChange={(e) => void handlePatch({ autoQa: e.target.checked })}
+              />
+            </label>
+          </section>
+
           {/* Jira Integration */}
           <section className="space-y-2 rounded-xl border border-hairline bg-card p-3">
             <div className="flex items-center justify-between">
@@ -700,22 +824,40 @@ export function TaskDetailDrawer({
                   <span>{jiraKey}</span>
                   <ExternalLink size={12} />
                 </a>
-                <button
-                  type="button"
-                  disabled={busy || !jiraEnabled}
-                  onClick={async () => {
-                    setBusy(true);
-                    const res = await syncJiraForTask(task.id);
-                    if (!res.ok && res.error) setError(res.error);
-                    await load();
-                    onTaskUpdated();
-                    setBusy(false);
-                  }}
-                  className="inline-flex items-center gap-1 rounded-lg border border-hairline bg-control px-2.5 py-1 text-[11px] text-ink hover:bg-raised-hover disabled:opacity-50"
-                >
-                  <RefreshCw size={11} />
-                  <span>{t("workTasks.jira.syncNow")}</span>
-                </button>
+                <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    disabled={busy || !jiraEnabled}
+                    onClick={async () => {
+                      setBusy(true);
+                      const res = await pullJiraForTask(task.id);
+                      if (!res.ok && res.error) setError(res.error);
+                      await load();
+                      onTaskUpdated();
+                      setBusy(false);
+                    }}
+                    className="inline-flex items-center gap-1 rounded-lg border border-hairline bg-control px-2.5 py-1 text-[11px] text-ink hover:bg-raised-hover disabled:opacity-50"
+                  >
+                    <Download size={11} />
+                    <span>{t("workTasks.jira.pullNow")}</span>
+                  </button>
+                  <button
+                    type="button"
+                    disabled={busy || !jiraEnabled}
+                    onClick={async () => {
+                      setBusy(true);
+                      const res = await syncJiraForTask(task.id);
+                      if (!res.ok && res.error) setError(res.error);
+                      await load();
+                      onTaskUpdated();
+                      setBusy(false);
+                    }}
+                    className="inline-flex items-center gap-1 rounded-lg border border-hairline bg-control px-2.5 py-1 text-[11px] text-ink hover:bg-raised-hover disabled:opacity-50"
+                  >
+                    <RefreshCw size={11} />
+                    <span>{t("workTasks.jira.syncNow")}</span>
+                  </button>
+                </div>
               </div>
             ) : (
               <div className="space-y-2">
